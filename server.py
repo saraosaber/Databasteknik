@@ -133,8 +133,6 @@ def post_performances():
         return f"/performances/{screening_id}"
 
 
-
-
 @get('/movies')
 def get_movies():
     c = db.cursor()
@@ -221,7 +219,7 @@ def post_tickets():
     if not found:
         response.status = 400
         return "Performance not found"
-    seats_before = found[0]
+    seats_before, = found
     c.execute(
         """
         SELECT password
@@ -288,9 +286,9 @@ def get_utickets(username):
         SELECT date, start_time, theater_name, title, prod_year, count() as nbrOfTickets
         FROM ticket
         JOIN screening USING  (screening_id)
-        Join movie using (imdb_key)
+        JOIN movie USING (imdb_key)
         WHERE username = ?
-        group by (screening_id)
+        GROUP BY (screening_id)
         """,
         [username]
         )
