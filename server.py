@@ -18,25 +18,18 @@ def reset():
         c.execute("DELETE FROM screening")
         c.execute("DELETE FROM movie")
         c.execute("DELETE FROM ticket")
-        c.execute("DELETE FROM movie")
         c.execute("DELETE FROM customer")
         db.commit()
 
         c.execute(
             """
-            INSERT INTO theater(name, capacity) VALUES (?, ?)
+            INSERT 
+            INTO theater(name, capacity) 
+            VALUES (?, ?), 
+                   (?, ?), 
+                   (?, ?)
             """, 
-            ("Kino", 10))
-        c.execute(
-            """
-            INSERT INTO theater(name, capacity) VALUES (?, ?)
-            """, 
-            ("Regal", 16))
-        c.execute(
-            """
-            INSERT INTO theater(name, capacity) VALUES (?, ?)
-            """, 
-            ("Skandia", 100))
+            ("Kino", 10, "Regal", 16, "Skandia", 100))
         db.commit()
         response.status = 201
         return "Database reset successfully."
@@ -56,7 +49,7 @@ def post_users():
             VALUES(?,?,?)
             RETURNING username
             """,
-            (customer['username'], customer['fullName'], hash(customer['pwd']))
+            (customer['username'], customer['fullName'], my_hash(customer['pwd']))
         )
         found = c.fetchone()
         if not found:
@@ -70,7 +63,7 @@ def post_users():
     except sqlite3.IntegrityError:
             response.status = 409
             return "username already in use"      
-def hash(msg):
+def my_hash(msg):
     import hashlib
     return hashlib.sha256(msg.encode('utf-8')).hexdigest()
 
@@ -103,31 +96,42 @@ def post_movies():
             return "imdbKey already in use"      
 
 @post('/performances')
-def post_movies():
+def post_performances():
     performance = request.json
     c = db.cursor()
-    try: 
+    c.execute(
+    """
+    INSERT
+    INTO screening(imdb_key, theater_name, date, start_time)
+    VALUES (?,?,?,?)
+    RETURNING screening_id
+    """,
+    [performance['imdbKey'], performance['theater'], performance['date'], performance['time']]
+    )
+
+    found = c.fetchone()
+    if not found:
+        response.status = 400
+        return "No such movie or theater"
+    else:
+        db.commit()
+        screening_id, = found
         c.execute(
             """
-            INSERT 
-            INTO screening(IMDB_key, theater_name, date, start_time)
-            VALUES(?,?,?,?)
-            RETURNING screening_id
+            UPDATE screening
+            SET available_seats = (SELECT capacity
+            FROM theater
+            WHERE name = screening.theater_name)
+            WHERE screening_id = ?
             """,
-            (performance['imdbKey'], performance['theater'], performance['date'], performance['time'])
+            [screening_id]
         )
-        found = c.fetchone()
-        if not found:
-            response.status = 400
-            return "oh noo didnt work "
-        else:
-            db.commit()
-            response.status = 201
-            performance = found
-            return f"/performances/{performance[0]}"
-    except sqlite3.IntegrityError:
-            response.status = 409
-            return "imdbKey already in use" 
+        db.commit()
+        response.status = 201
+
+
+        return f"/performances/{screening_id}"
+
 
 
 
@@ -178,7 +182,7 @@ def get_performances():
     c = db.cursor()
     c.execute(
           """
-          SELECT screening_id, date, start_time, title, prod_year, theater_name, capacity
+          SELECT screening_id, date, start_time, title, prod_year, theater_name, available_seats
           FROM screening
           INNER JOIN movie using(imdb_key)
           INNER JOIN theater ON screening.theater_name == theater.name
@@ -199,45 +203,101 @@ def get_performances():
         response.status = 200
     return {"data": response_data}
 
+
+
 @post('/tickets')
 def post_tickets():
-    purchase = request.json
+    ticket = request.json
     c = db.cursor()
-    try: 
+    c.execute(
+        """
+        SELECT available_seats
+        FROM screening
+        WHERE screening_id = ?
+        """,
+        [ticket['performanceId']]
+    )
+    found = c.fetchone()
+    if not found:
+        response.status = 400
+        return "Performance not found"
+    seats_before = found[0]
+    c.execute(
+        """
+        SELECT password
+        FROM customer
+        WHERE username = ?
+        """,
+        [ticket['username']]
+    )
+    found = c.fetchone()
+    if not found:
+        response.status = 401
+        return "Wrong user credentials"
+
+    password = found[0]
+    hashed_pwd = my_hash(ticket['pwd'])
+
+    if seats_before > 0 and password == hashed_pwd:
+        db.execute("begin")
         c.execute(
             """
-            WITH customer(username) AS (
-                SELECT username 
-                FROM customer
-                WHERE username = ? AND password = ?
-            ),
-            seats(screening_id, available_seats) AS (
-                SELECT screening_id, (capacity - count(*)) as available_seats
-                FROM ticket
-                INNER JOIN theater ON ticket.theater_name == theater.name
-                WHERE screening_id = ?
-                GROUP BY screening_id
-                HAVING available_seats > 0
-            )
-            INSERT INTO ticket (username, screening_id) 
-            VALUES (customer.username, seats.screening_id)
-            returning ticket_id
+            INSERT INTO ticket(username, screening_id)
+            VALUES (?, ?)
+            RETURNING ticket_id
+            """,
+            [ticket['username'], ticket['performanceId']]
+        )
+        ticket_id = c.fetchone()[0]
+        c.execute(
             """
-            (purchase["username"], hash(purchase["pwd"]), purchase['performanceId'])
+            UPDATE screening
+            SET available_seats = available_seats - 1
+            WHERE screening_id = ?
+            """,
+            [ticket['performanceId']]
+        )
+        db.commit()
+        c.execute(
+            """
+            SELECT available_seats
+            FROM screening
+            WHERE screening_id = ?
+            """,
+            [ticket['performanceId']]
         )
         found = c.fetchone()
-        if not found:
-            response.status = 400
-            return "oh noo didnt work "
-        else:
-            db.commit()
-            response.status = 201
-            ticket = found
-            return f"/tickets/{ticket[0]}"
-    except sqlite3.IntegrityError:
-            response.status = 409
-            return "No available seats" 
+        seats_after = found[0]
+
+        response.status = 201
+        return f"/tickets/{ticket_id}"
+    elif seats_before == 0:
+        response.status = 400
+        return "No tickets left"
+    else:
+        response.status = 401
+        return "Wrong user credentials"
 
 
+
+@get('/users/<username>/tickets')
+def get_utickets(username):
+    c = db.cursor()
+    c.execute(
+        """
+        SELECT date, start_time, theater_name, title, prod_year, count() as nbrOfTickets
+        FROM ticket
+        JOIN screening USING  (screening_id)
+        Join movie using (imdb_key)
+        WHERE username = ?
+        group by (screening_id)
+        """,
+        [username]
+        )
+
+    found = [{"date": date, "startTime": time, "theater": theater, "title": title, "year": year, "nbrOfTickets":nbrOfTickets}
+         for (date, time, theater, title, year, nbrOfTickets) in c]
+    response.status = 200
+    return {"data": found}
 
 run(host='localhost', port=PORT)
